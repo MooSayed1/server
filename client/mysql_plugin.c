@@ -48,12 +48,21 @@
 #if defined(INSTALL_LAYOUT_RPM) || defined(INSTALL_LAYOUT_DEB)
 #define PKG_DELEGATION 1
 #include <sys/wait.h>
+#elif defined(_WIN32)
+#include <direct.h>
+#endif
+
+#ifndef PKG_DELEGATION
+#include <zlib.h>
+#include <mysql/service_sha2.h>
 #endif
 
 /* Global variables. */
 static uint my_end_arg= 0;
 static uint opt_verbose=0;
 static my_bool opt_dry_run= 0;
+static char *opt_file= 0;
+static char *opt_sha256= 0;
 static uint opt_no_defaults= 0;
 static uint opt_print_defaults= 0;
 static char *opt_datadir=0, *opt_basedir=0,
@@ -88,6 +97,12 @@ static struct my_option my_long_options[] =
   {"dry-run", 0, "Print the commands that install and uninstall would run, "
    "without running them.",
     &opt_dry_run, &opt_dry_run, 0, GET_BOOL, NO_ARG, 0, 0, 0, 0, 0, 0},
+  {"file", 0, "Install the plugin from this local tarball instead of "
+   "downloading it.",
+    &opt_file, &opt_file, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
+  {"sha256", 0, "Expected SHA-256 checksum of the tarball, as published "
+   "beside it. Refuse to install if it does not match.",
+    &opt_sha256, &opt_sha256, 0, GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
   {"no-defaults", 'n', "Do not read values from configuration file.",
     0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0},
   {"print-defaults", 'P', "Show default values from configuration file.",
@@ -2118,6 +2133,811 @@ static int do_search(const char *term, const char *basedir)
 }
 
 
+#ifndef PKG_DELEGATION
+
+/*
+  On tarball installations nothing tracks what a plugin put on disk, so
+  install writes a manifest and uninstall acts strictly on it: the header
+  lines describe the plugin, each "file:" or "dir:" line is one path,
+  relative to the basedir, that install created and uninstall removes.
+*/
+
+#define MANIFEST_SUBDIR ".mariadb-plugin"
+
+struct manifest_entry
+{
+  char path[FN_REFLEN];
+  my_bool is_dir;
+};
+
+
+static int build_full_path(char *to, size_t size, const char *basedir,
+                           const char *rel)
+{
+  if (safe_strcpy_truncated(to, size, basedir) ||
+      safe_strcat(to, size, "/") || safe_strcat(to, size, rel))
+  {
+    fprintf(stderr, "ERROR: path is too long: '%s/%s'.\n", basedir, rel);
+    return 1;
+  }
+  return 0;
+}
+
+
+static int build_manifest_path(char *to, size_t size, const char *basedir,
+                               const char *name)
+{
+  if (build_full_path(to, size, basedir, MANIFEST_SUBDIR "/") ||
+      safe_strcat(to, size, name) || safe_strcat(to, size, ".list"))
+    return 1;
+  return 0;
+}
+
+
+/**
+  Check that a relative path stays inside the basedir.
+
+  Used for manifest lines and archive entries alike, neither of which is
+  trusted input: an absolute path or a ".." component would let install
+  write, and uninstall delete, files the plugin never owned.
+
+  @param[in]  path  The path, relative to the basedir.
+
+  @retval int acceptable = 1, not = 0
+*/
+
+static int valid_relative_path(const char *path)
+{
+  /* tar paths use '/', so a backslash only ever comes from hostile input */
+  if (!*path || *path == '/' || strchr(path, '\\') || strstr(path, ".."))
+    return 0;
+  /* a drive letter escapes the basedir on Windows */
+  if (isalpha((uchar) path[0]) && path[1] == ':')
+    return 0;
+  return 1;
+}
+
+
+/**
+  Read and validate a manifest.
+
+  All entries are validated before the caller deletes anything, so that a
+  corrupt manifest results in no deletions at all, not in a partial run.
+
+  @param[in]   manifest  Path of the manifest file.
+  @param[out]  entries   Initialized array, filled with manifest_entry.
+
+  @retval int error = 1, success = 0
+*/
+
+static int read_manifest(const char *manifest, DYNAMIC_ARRAY *entries)
+{
+  FILE *file;
+  char line[FN_REFLEN];
+  struct manifest_entry e;
+  const char *path;
+  size_t len;
+  int error= 0;
+
+  if (!(file= fopen(manifest, "r")))
+  {
+    fprintf(stderr, "ERROR: cannot read '%s': %s.\n", manifest,
+            strerror(errno));
+    return 1;
+  }
+  while (!error && fgets(line, sizeof(line), file))
+  {
+    len= strlen(line);
+    /* a manifest this tool wrote contains no NUL bytes and no oversized
+       lines; either one means the file is not to be trusted */
+    if (!len || (line[len - 1] != '\n' && !feof(file)))
+    {
+      fprintf(stderr, "ERROR: '%s' is corrupt, nothing was removed.\n",
+              manifest);
+      error= 1;
+      break;
+    }
+    while (len && (line[len - 1] == '\n' || line[len - 1] == '\r'))
+      line[--len]= '\0';
+
+    e.is_dir= strncmp(line, "dir: ", 5) == 0;
+    if (e.is_dir)
+      path= line + 5;
+    else if (strncmp(line, "file: ", 6) == 0)
+      path= line + 6;
+    else
+      continue;  /* header lines; uninstall only consumes the paths */
+
+    if (!valid_relative_path(path))
+    {
+      fprintf(stderr, "ERROR: unsafe path '%s' in '%s', nothing was "
+              "removed.\n", path, manifest);
+      error= 1;
+      break;
+    }
+    safe_strcpy(e.path, sizeof(e.path), path);
+    error= insert_dynamic(entries, &e);
+  }
+  fclose(file);
+  return error;
+}
+
+
+/**
+  Delete everything a manifest lists, then the manifest.
+
+  Used by uninstall, and by install to undo a failed extraction. The
+  order makes an interruption harmless: files, then the directories
+  install created (children first), then the manifest, which is kept if
+  anything failed, so the operation can always be run again.
+
+  @param[in]  basedir   The base directory.
+  @param[in]  manifest  Path of the manifest file.
+
+  @retval int error = 1, success = 0
+*/
+
+static int manifest_remove(const char *basedir, const char *manifest)
+{
+  char full[FN_REFLEN];
+  DYNAMIC_ARRAY entries;
+  struct manifest_entry *e;
+  size_t i;
+  int failed= 0;
+
+  if (my_init_dynamic_array(PSI_NOT_INSTRUMENTED, &entries,
+                            sizeof(struct manifest_entry), 16, 16,
+                            MYF(MY_WME)))
+    return 1;
+  if (read_manifest(manifest, &entries))
+  {
+    delete_dynamic(&entries);
+    return 1;
+  }
+
+  for (i= 0; i < entries.elements; i++)
+  {
+    e= dynamic_element(&entries, i, struct manifest_entry *);
+    if (e->is_dir)
+      continue;
+    if (build_full_path(full, sizeof(full), basedir, e->path))
+    {
+      /* an undeletable file must keep the manifest, or it is orphaned */
+      failed= 1;
+      continue;
+    }
+    if (opt_dry_run)
+      printf("would delete %s\n", full);
+    else if (my_delete(full, MYF(0)))
+    {
+      /* a file someone already removed by hand must not block uninstall */
+      if (my_errno == ENOENT)
+        fprintf(stderr, "WARNING: '%s' was already gone.\n", full);
+      else
+      {
+        fprintf(stderr, "ERROR: cannot delete '%s': %s.\n", full,
+                strerror(my_errno));
+        failed= 1;
+      }
+    }
+  }
+
+  /* directories in reverse manifest order, so children come before parents */
+  for (i= entries.elements; i-- > 0; )
+  {
+    e= dynamic_element(&entries, i, struct manifest_entry *);
+    if (!e->is_dir || build_full_path(full, sizeof(full), basedir, e->path))
+      continue;
+    if (opt_dry_run)
+      printf("would remove directory %s\n", full);
+    else if (rmdir(full) && errno != ENOENT)
+      fprintf(stderr, "WARNING: directory '%s' was not removed: %s.\n", full,
+              strerror(errno));
+  }
+  delete_dynamic(&entries);
+
+  if (failed)
+  {
+    fprintf(stderr, "ERROR: not all files could be deleted; the manifest "
+            "was kept, so uninstall can be run again.\n");
+    return 1;
+  }
+  if (opt_dry_run)
+  {
+    printf("would delete %s\n", manifest);
+    return 0;
+  }
+  if (my_delete(manifest, MYF(MY_WME)))
+    return 1;
+  /* the manifest directory goes with the last plugin; busy is fine */
+  if (!build_full_path(full, sizeof(full), basedir, MANIFEST_SUBDIR))
+    rmdir(full);
+  return 0;
+}
+
+
+/*
+  The tool reads plugin tarballs itself instead of running tar: every entry
+  is judged before anything is written, no tar binary is needed on the
+  machine, and no command line is ever built from a user-chosen path.
+
+  Only what CPack produces is accepted: ustar headers with regular files and
+  directories, plus the two ways a long path is spelled, GNU long-name
+  entries and pax "path" records. Links and devices are refused.
+*/
+
+#define TAR_BLOCK 512
+
+struct tar_reader
+{
+  gzFile gz;
+  const char *file;
+  ulonglong data_left;  /* unread bytes of the current entry, plus padding */
+};
+
+struct tar_entry
+{
+  char path[FN_REFLEN];
+  ulonglong size;
+  uint mode;
+  my_bool is_dir;
+};
+
+
+static int tar_open(struct tar_reader *r, const char *file)
+{
+  r->file= file;
+  r->data_left= 0;
+  if (!(r->gz= gzopen(file, "rb")))
+  {
+    fprintf(stderr, "ERROR: cannot open '%s': %s.\n", file, strerror(errno));
+    return 1;
+  }
+  return 0;
+}
+
+
+static void tar_close(struct tar_reader *r)
+{
+  gzclose(r->gz);
+}
+
+
+static int tar_read_bytes(struct tar_reader *r, void *buf, size_t len)
+{
+  int n= gzread(r->gz, buf, (unsigned) len);
+  if (n != (int) len)
+  {
+    int err;
+    const char *msg= gzerror(r->gz, &err);
+    fprintf(stderr, "ERROR: '%s' is truncated or not a gzip file%s%s.\n",
+            r->file, err == Z_ERRNO || err == Z_OK ? "" : ": ",
+            err == Z_ERRNO || err == Z_OK ? "" : msg);
+    return 1;
+  }
+  return 0;
+}
+
+
+static int tar_skip_data(struct tar_reader *r)
+{
+  if (r->data_left && gzseek(r->gz, (z_off_t) r->data_left, SEEK_CUR) < 0)
+  {
+    fprintf(stderr, "ERROR: '%s' is truncated.\n", r->file);
+    return 1;
+  }
+  r->data_left= 0;
+  return 0;
+}
+
+
+/**
+  Parse a tar numeric field: octal digits, terminated by NUL or space.
+
+  @retval int error = 1, success = 0
+*/
+
+static int tar_number(const uchar *field, size_t len, ulonglong *out)
+{
+  ulonglong v= 0;
+  size_t i;
+
+  /* GNU base-256 encoding is only used past 8 GB; no plugin is that big */
+  if (field[0] & 0x80)
+    return 1;
+  for (i= 0; i < len && field[i] == ' '; i++) ;
+  for (; i < len && field[i] != '\0' && field[i] != ' '; i++)
+  {
+    if (field[i] < '0' || field[i] > '7')
+      return 1;
+    v= v * 8 + (field[i] - '0');
+  }
+  *out= v;
+  return 0;
+}
+
+
+static int tar_checksum_ok(const uchar *block)
+{
+  ulonglong stored;
+  unsigned sum= 0;
+  size_t i;
+
+  if (tar_number(block + 148, 8, &stored))
+    return 0;
+  for (i= 0; i < TAR_BLOCK; i++)
+    sum+= (i >= 148 && i < 156) ? ' ' : block[i];
+  return sum == stored;
+}
+
+
+/**
+  Read the next file or directory entry.
+
+  Long-name and pax entries are consumed here and applied to the entry that
+  follows them, so callers only ever see real files and directories. The
+  entry's data is left unread; call tar_skip_data() before the next entry.
+
+  @param[in]   r  The open reader.
+  @param[out]  e  The entry.
+
+  @retval int  1 = entry returned, 0 = end of archive, -1 = error
+*/
+
+static int tar_next(struct tar_reader *r, struct tar_entry *e)
+{
+  uchar block[TAR_BLOCK];
+  char longname[FN_REFLEN];
+  ulonglong size, mode;
+  size_t len;
+  char type;
+
+  longname[0]= '\0';
+  for (;;)
+  {
+    if (tar_skip_data(r) || tar_read_bytes(r, block, TAR_BLOCK))
+      return -1;
+    if (block[0] == '\0')  /* the end-of-archive marker */
+      return 0;
+    if (memcmp(block + 257, "ustar", 5) != 0 || !tar_checksum_ok(block))
+    {
+      fprintf(stderr, "ERROR: '%s' is not a valid tar archive.\n", r->file);
+      return -1;
+    }
+    if (tar_number(block + 124, 12, &size) || tar_number(block + 100, 8, &mode))
+    {
+      fprintf(stderr, "ERROR: '%s' has a corrupt entry header.\n", r->file);
+      return -1;
+    }
+    r->data_left= (size + TAR_BLOCK - 1) / TAR_BLOCK * TAR_BLOCK;
+    type= block[156];
+
+    if (type == 'L' || type == 'x')
+    {
+      /* the data of these entries names the entry after them */
+      char *buf, *p, *end;
+      if (size >= sizeof(longname) * 4)
+      {
+        fprintf(stderr, "ERROR: '%s' has an entry name that is too long.\n",
+                r->file);
+        return -1;
+      }
+      if (!(buf= (char *) my_malloc(PSI_NOT_INSTRUMENTED, (size_t) size + 1,
+                                    MYF(MY_WME))))
+        return -1;
+      if (tar_read_bytes(r, buf, (size_t) size))
+      {
+        my_free(buf);
+        return -1;
+      }
+      buf[size]= '\0';
+      r->data_left-= size;
+      if (type == 'L')
+        safe_strcpy(longname, sizeof(longname), buf);
+      else
+      {
+        /* pax records: "<len> <key>=<value>\n"; only the path matters */
+        for (p= buf; (end= strchr(p, '\n')); p= end + 1)
+        {
+          char *eq= strchr(p, '=');
+          *end= '\0';
+          if (eq && eq - p >= 5 && strncmp(eq - 5, " path", 5) == 0)
+            safe_strcpy(longname, sizeof(longname), eq + 1);
+        }
+      }
+      my_free(buf);
+      continue;
+    }
+    if (type == 'g')  /* pax global header, carries nothing we use */
+      continue;
+    break;
+  }
+
+  switch (type) {
+  case '0': case '\0': case '7':
+    e->is_dir= FALSE;
+    break;
+  case '5':
+    e->is_dir= TRUE;
+    break;
+  case '1': case '2':
+    fprintf(stderr, "ERROR: '%s' contains a link, which plugin archives "
+            "must not have.\n", r->file);
+    return -1;
+  default:
+    fprintf(stderr, "ERROR: '%s' contains an entry of unsupported type "
+            "'%c'.\n", r->file, type);
+    return -1;
+  }
+
+  if (longname[0])
+    safe_strcpy(e->path, sizeof(e->path), longname);
+  else
+  {
+    /* ustar splits long paths into prefix (155) and name (100) */
+    e->path[0]= '\0';
+    if (block[345])
+    {
+      safe_strcpy_truncated(e->path, MY_MIN(sizeof(e->path), 156),
+                            (char *) block + 345);
+      safe_strcat(e->path, sizeof(e->path), "/");
+    }
+    len= strlen(e->path);
+    safe_strcpy_truncated(e->path + len, MY_MIN(sizeof(e->path) - len, 101),
+                          (char *) block + 0);
+  }
+  /* "./x" and "x/" spell the same thing; normalize before judging */
+  if (strncmp(e->path, "./", 2) == 0)
+    memmove(e->path, e->path + 2, strlen(e->path) - 1);
+  len= strlen(e->path);
+  while (len > 1 && e->path[len - 1] == '/')
+    e->path[--len]= '\0';
+
+  e->size= size;
+  /* setuid and setgid bits from an archive are never honored */
+  e->mode= (uint) mode & 0777;
+  return 1;
+}
+
+
+
+/**
+  Compute the SHA-256 of a file as 64 lower case hex digits.
+
+  @retval int error = 1, success = 0
+*/
+
+static int file_sha256(const char *file, char *hex)
+{
+  uchar buf[8192], digest[32];
+  void *ctx;
+  size_t n, i;
+  File fd;
+  int error= 0;
+
+  if ((fd= my_open(file, O_RDONLY | O_BINARY, MYF(MY_WME))) < 0)
+    return 1;
+  if (!(ctx= my_malloc(PSI_NOT_INSTRUMENTED, my_sha256_context_size(),
+                       MYF(MY_WME))))
+  {
+    my_close(fd, MYF(0));
+    return 1;
+  }
+  my_sha256_init(ctx);
+  while ((n= my_read(fd, buf, sizeof(buf), MYF(0))) > 0 && n != (size_t) -1)
+    my_sha256_input(ctx, buf, n);
+  if (n == (size_t) -1)
+  {
+    fprintf(stderr, "ERROR: cannot read '%s': %s.\n", file, strerror(my_errno));
+    error= 1;
+  }
+  my_sha256_result(ctx, digest);
+  my_free(ctx);
+  my_close(fd, MYF(0));
+  for (i= 0; i < sizeof(digest); i++)
+    sprintf(hex + 2 * i, "%02x", digest[i]);
+  return error;
+}
+
+
+/**
+  Compare the archive against the checksum the user was given for it.
+
+  Case does not matter; whitespace and the "sha256:" prefix some sites
+  print are tolerated. A mismatch means the file is not the one that was
+  published, whatever the reason, so nothing is installed from it.
+
+  @retval int error = 1, success = 0
+*/
+
+static int verify_sha256(const char *file, const char *expected, char *hex)
+{
+  const char *p= expected;
+  size_t i;
+
+  if (file_sha256(file, hex))
+    return 1;
+  while (*p == ' ' || *p == '\t') p++;
+  if (strncasecmp(p, "sha256:", 7) == 0)
+    p+= 7;
+  for (i= 0; i < 64 && p[i]; i++)
+    if (tolower((uchar) p[i]) != hex[i])
+      break;
+  if (i != 64 || (p[64] && !isspace((uchar) p[64])))
+  {
+    fprintf(stderr, "ERROR: '%s' does not match the expected checksum.\n"
+            "  expected: %s\n  actual:   %s\n", file, expected, hex);
+    return 1;
+  }
+  return 0;
+}
+
+/**
+  Read a whole archive, judging every entry, without writing anything.
+
+  CPack wraps an archive's contents in one directory named after the
+  archive file. When every entry lives under such a directory it is
+  stripped from the paths and dropped from the list, so the remaining paths
+  are relative to the basedir. Any other layout is taken as is: "lib/x" and
+  "top/lib/x" cannot be told apart by shape, only by that name.
+
+  @param[in]   file     The tarball.
+  @param[out]  entries  Initialized array, filled with tar_entry.
+  @param[out]  topdir   The stripped directory, "" when nothing was stripped.
+
+  @retval int error = 1, success = 0
+*/
+
+static int tar_scan(const char *file, DYNAMIC_ARRAY *entries, char *topdir)
+{
+  struct tar_reader r;
+  struct tar_entry e, *p;
+  const char *base;
+  my_bool have_topdir= TRUE;
+  size_t i, len;
+  int rc;
+
+  if (tar_open(&r, file))
+    return 1;
+  topdir[0]= '\0';
+  base= file + dirname_length(file);
+  while ((rc= tar_next(&r, &e)) > 0)
+  {
+    const char *slash;
+    if (!valid_relative_path(e.path))
+    {
+      fprintf(stderr, "ERROR: '%s' contains the unsafe path '%s'.\n", file,
+              e.path);
+      rc= -1;
+      break;
+    }
+    /* a top directory exists only if no entry sits beside it at the root */
+    slash= strchr(e.path, '/');
+    len= slash ? (size_t) (slash - e.path) : strlen(e.path);
+    if (!slash && !e.is_dir)
+      have_topdir= FALSE;
+    if (!topdir[0])
+      safe_strcpy_truncated(topdir, MY_MIN(FN_REFLEN, len + 1), e.path);
+    else if (strlen(topdir) != len || strncmp(topdir, e.path, len) != 0)
+      have_topdir= FALSE;
+    if (insert_dynamic(entries, &e))
+    {
+      rc= -1;
+      break;
+    }
+  }
+  tar_close(&r);
+  if (rc < 0)
+    return 1;
+  if (!entries->elements)
+  {
+    fprintf(stderr, "ERROR: '%s' is empty.\n", file);
+    return 1;
+  }
+  len= strlen(topdir);
+  if (!have_topdir || strncmp(base, topdir, len) != 0 ||
+      (base[len] != '\0' && base[len] != '.'))
+  {
+    topdir[0]= '\0';
+    return 0;
+  }
+
+  for (i= 0; i < entries->elements; )
+  {
+    p= dynamic_element(entries, i, struct tar_entry *);
+    if (strlen(p->path) == len)  /* the top directory itself */
+      delete_dynamic_element(entries, i);
+    else
+    {
+      memmove(p->path, p->path + len + 1, strlen(p->path) - len);
+      i++;
+    }
+  }
+  if (!entries->elements)
+  {
+    fprintf(stderr, "ERROR: '%s' contains only an empty directory.\n", file);
+    return 1;
+  }
+  return 0;
+}
+
+
+/**
+  Append one line to the manifest and flush it, so that the manifest on
+  disk never lags behind what was actually created.
+
+  @retval int error = 1, success = 0
+*/
+
+static int manifest_append(FILE *m, const char *key, const char *value)
+{
+  if (fprintf(m, "%s: %s\n", key, value) < 0 || fflush(m))
+  {
+    fprintf(stderr, "ERROR: cannot write the manifest: %s.\n",
+            strerror(errno));
+    return 1;
+  }
+  return 0;
+}
+
+
+/**
+  Copy one entry's data from the archive into a new file.
+
+  The file is created with O_EXCL: it must not exist, so nothing on disk
+  is ever overwritten, not even by a file that appeared after the check.
+
+  @retval int error = 1, success = 0
+*/
+
+static int tar_extract_file(struct tar_reader *r, struct tar_entry *e,
+                            const char *full)
+{
+  char buf[8192];
+  ulonglong left= e->size;
+  File fd;
+  int error= 0;
+
+  if ((fd= my_open(full, O_WRONLY | O_CREAT | O_EXCL | O_BINARY,
+                   MYF(0))) < 0)
+  {
+    fprintf(stderr, "ERROR: cannot create '%s': %s.\n", full,
+            strerror(my_errno));
+    return 1;
+  }
+  while (left && !error)
+  {
+    size_t n= (size_t) MY_MIN(left, sizeof(buf));
+    if (tar_read_bytes(r, buf, n) ||
+        my_write(fd, (uchar *) buf, n, MYF(MY_WME | MY_NABP)))
+      error= 1;
+    left-= n;
+    r->data_left-= n;
+  }
+  if (my_close(fd, MYF(MY_WME)))
+    error= 1;
+  if (!error && e->mode)
+    my_chmod(full, e->mode, MYF(0));
+  return error;
+}
+
+
+/**
+  Create every directory and file the scan approved, recording each in
+  the manifest as it is made. Directories that already exist are used,
+  not recorded, so uninstall never removes what it did not create.
+
+  Entries are written in archive order, parents before children, which
+  is the order uninstall relies on when it removes them in reverse.
+
+  @retval int error = 1, success = 0
+*/
+
+static int tar_extract(const char *file, const char *basedir,
+                       const char *topdir, DYNAMIC_ARRAY *entries, FILE *m)
+{
+  struct tar_reader r;
+  struct tar_entry e;
+  char full[FN_REFLEN];
+  size_t skip= topdir[0] ? strlen(topdir) + 1 : 0;
+  size_t i;
+  int rc;
+
+  if (tar_open(&r, file))
+    return 1;
+  /* the archive is walked again, in step with the approved entry list */
+  for (i= 0; i < entries->elements; i++)
+  {
+    struct tar_entry *ok= dynamic_element(entries, i, struct tar_entry *);
+    do
+    {
+      if ((rc= tar_next(&r, &e)) <= 0)
+      {
+        if (rc == 0)
+          fprintf(stderr, "ERROR: '%s' changed while it was being read.\n",
+                  file);
+        tar_close(&r);
+        return 1;
+      }
+    } while (strlen(e.path) < skip || strcmp(e.path + skip, ok->path) != 0);
+
+    if (build_full_path(full, sizeof(full), basedir, ok->path))
+      goto err;
+    if (e.is_dir)
+    {
+      if (file_exists(full))
+        continue;
+      if (my_mkdir(full, 0755, MYF(0)))
+      {
+        fprintf(stderr, "ERROR: cannot create directory '%s': %s.\n", full,
+                strerror(my_errno));
+        goto err;
+      }
+      if (manifest_append(m, "dir", ok->path))
+        goto err;
+    }
+    else
+    {
+      if (tar_extract_file(&r, &e, full))
+        goto err;
+      if (manifest_append(m, "file", ok->path))
+        goto err;
+    }
+  }
+  tar_close(&r);
+  return 0;
+
+err:
+  tar_close(&r);
+  return 1;
+}
+
+
+/**
+  Tell the user how to enable what was just installed. Install never
+  edits the server configuration: a tarball installation has no conf.d
+  and no convention for one, and the user may keep my.cnf anywhere.
+*/
+
+static void print_enable_instructions(const char *basedir,
+                                      DYNAMIC_ARRAY *entries)
+{
+  size_t i, prefix= sizeof(STR(INSTALL_PLUGINDIR)) - 1;
+  int pass, shown= 0;
+
+  /* two passes: the INSTALL SONAME lines, then the plugin-load-add lines */
+  for (pass= 0; pass < 2; pass++)
+  {
+    for (i= 0; i < entries->elements; i++)
+    {
+      struct tar_entry *e= dynamic_element(entries, i, struct tar_entry *);
+      const char *name= e->path + prefix + 1, *ext;
+      if (e->is_dir ||
+          strncmp(e->path, STR(INSTALL_PLUGINDIR), prefix) != 0 ||
+          e->path[prefix] != '/' || strchr(name, '/') ||
+          !(ext= strstr(name, SO_EXT)))
+        continue;
+      if (pass == 0)
+      {
+        if (!shown++)
+          printf("To enable it, either run in the server:\n");
+        printf("  INSTALL SONAME '%.*s';\n", (int) (ext - name), name);
+      }
+      else
+        printf("  plugin-load-add=%s\n", name);
+    }
+    if (pass == 0 && shown)
+      printf("or add to your server configuration and restart:\n"
+             "  [mariadb]\n");
+  }
+  if (!shown)
+    printf("No plugin library was found under %s/%s; nothing to enable.\n",
+           basedir, STR(INSTALL_PLUGINDIR));
+}
+
+#endif /* !PKG_DELEGATION */
+
+
 /**
   Install a plugin.
 
@@ -2150,9 +2970,124 @@ static int do_install(const char *name, const char *basedir)
   cmd_argv[3]= 0;
   return run_argv(cmd_argv);
 #else
-  printf("install: '%s' (%s installation%s%s) not implemented yet\n", name,
-         INSTALL_METHOD_NAME, *basedir ? ", basedir=" : "", basedir);
-  return 0;
+  char manifest[FN_REFLEN], full[FN_REFLEN], topdir[FN_REFLEN];
+  char sha256[65];
+  DYNAMIC_ARRAY entries;
+  struct tar_entry *e;
+  FILE *m= 0;
+  size_t i;
+  int error= 1;
+
+  if (!opt_file)
+  {
+    fprintf(stderr, "ERROR: downloading plugins is not implemented yet, "
+            "use --file=<tarball>.\n");
+    return 1;
+  }
+  if (build_manifest_path(manifest, sizeof(manifest), basedir, name))
+    return 1;
+  if (file_exists(manifest))
+  {
+    fprintf(stderr, "ERROR: plugin '%s' is already installed.\n", name);
+    return 1;
+  }
+  if (opt_sha256)
+  {
+    if (verify_sha256(opt_file, opt_sha256, sha256))
+      return 1;
+  }
+  else
+  {
+    safe_strcpy(sha256, sizeof(sha256), "unverified");
+    fprintf(stderr, "WARNING: no --sha256 given, the tarball is not "
+            "verified.\n");
+  }
+  if (my_init_dynamic_array(PSI_NOT_INSTRUMENTED, &entries,
+                            sizeof(struct tar_entry), 64, 64, MYF(MY_WME)))
+    return 1;
+  if (tar_scan(opt_file, &entries, topdir))
+    goto end;
+
+  /*
+    Everything is judged before anything is written: a file that already
+    exists is refused, as it belongs to the server or to another plugin.
+  */
+  for (i= 0; i < entries.elements; i++)
+  {
+    e= dynamic_element(&entries, i, struct tar_entry *);
+    if (build_full_path(full, sizeof(full), basedir, e->path))
+      goto end;
+    if (!e->is_dir && file_exists(full))
+    {
+      fprintf(stderr, "ERROR: '%s' already exists, refusing to overwrite "
+              "it.\n", full);
+      goto end;
+    }
+  }
+
+  for (i= 0; i < entries.elements; i++)
+  {
+    e= dynamic_element(&entries, i, struct tar_entry *);
+    build_full_path(full, sizeof(full), basedir, e->path);
+    if (e->is_dir && file_exists(full))
+      continue;  /* an existing directory is used, not created or recorded */
+    if (opt_dry_run)
+      printf("would %s %s\n", e->is_dir ? "create directory" : "install",
+             full);
+  }
+  if (opt_dry_run)
+  {
+    printf("would write %s\n", manifest);
+    error= 0;
+    goto end;
+  }
+
+  /*
+    The manifest is written before the first file and appended to as
+    each one lands, so at any moment it lists exactly what is on disk.
+    Whatever fails from here on is undone through that same manifest.
+  */
+  /* mysys defaults new directories to 0700, made for a datadir; a plugin
+     tree must stay readable by the server, which may run as another user */
+  my_umask_dir= 0755;
+  if (build_full_path(full, sizeof(full), basedir, MANIFEST_SUBDIR))
+    goto end;
+  if (!file_exists(full) && my_mkdir(full, 0755, MYF(MY_WME)))
+    goto end;
+  if (!(m= my_fopen(manifest, O_WRONLY | O_CREAT | O_EXCL, MYF(MY_WME))))
+    goto end;
+  {
+    char today[16];
+    struct tm *t;
+    time_t now= time(0);
+    t= localtime(&now);
+    strftime(today, sizeof(today), "%Y-%m-%d", t);
+    if (manifest_append(m, "name", name) ||
+        manifest_append(m, "source", opt_file) ||
+        manifest_append(m, "sha256", sha256) ||
+        manifest_append(m, "date", today) ||
+        (topdir[0] && manifest_append(m, "topdir", topdir)))
+      goto rollback;
+  }
+  if (tar_extract(opt_file, basedir, topdir, &entries, m))
+    goto rollback;
+  my_fclose(m, MYF(0));
+  m= 0;
+
+  printf("Plugin '%s' installed into %s.\n", name, basedir);
+  print_enable_instructions(basedir, &entries);
+  error= 0;
+  goto end;
+
+rollback:
+  if (m)
+    my_fclose(m, MYF(0));
+  fprintf(stderr, "ERROR: installation of '%s' failed, removing what was "
+          "written.\n", name);
+  manifest_remove(basedir, manifest);
+end:
+  delete_dynamic(&entries);
+  return error;
 #endif
 }
 
@@ -2234,8 +3169,19 @@ static int do_uninstall(const char *name, const char *basedir)
 #endif
   return error;
 #else
-  printf("uninstall: '%s' (%s installation%s%s) not implemented yet\n", name,
-         INSTALL_METHOD_NAME, *basedir ? ", basedir=" : "", basedir);
+  char manifest[FN_REFLEN];
+
+  if (build_manifest_path(manifest, sizeof(manifest), basedir, name))
+    return 1;
+  if (!file_exists(manifest))
+  {
+    fprintf(stderr, "ERROR: plugin '%s' is not installed.\n", name);
+    return 1;
+  }
+  if (manifest_remove(basedir, manifest))
+    return 1;
+  if (!opt_dry_run)
+    printf("Plugin '%s' uninstalled from %s.\n", name, basedir);
   return 0;
 #endif
 }

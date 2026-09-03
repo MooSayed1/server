@@ -75,7 +75,7 @@ MYSQL_ADD_EXECUTABLE(mariadb-show mysqlshow.c)
 TARGET_LINK_LIBRARIES(mariadb-show ${CLIENT_LIB})
 
 MYSQL_ADD_EXECUTABLE(mariadb-plugin mysql_plugin.c)
-TARGET_LINK_LIBRARIES(mariadb-plugin ${CLIENT_LIB})
+TARGET_LINK_LIBRARIES(mariadb-plugin ${CLIENT_LIB} mysys_ssl)
 # The tool needs to know how MariaDB was installed to pick the way plugins
 # are installed. The install layout is only known when building, so it is
 # passed to the tool, together with the directories it has to verify.
